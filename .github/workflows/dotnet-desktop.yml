@@ -1,0 +1,114 @@
+name: Deploy to EC2
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Setup .NET Core
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: '6.0.x'
+      
+      - name: Restore dependencies
+        run: dotnet restore
+      
+      - name: Build application
+        run: dotnet build --no-restore --configuration Release
+      
+      - name: Publish application
+        run: dotnet publish --configuration Release --no-build
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+      
+      - name: Deploy to EC2 instances
+        run: |
+          # Get all EC2 instance IDs in the ASG
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-name ${{ vars.PROJECT_NAME || 'artisan-tiling' }}-asg \
+            --query "AutoScalingGroups[0].Instances[*].InstanceId" \
+            --output text)
+          
+          if [ -z "$INSTANCE_IDS" ]; then
+            echo "No instances found in the ASG"
+            exit 1
+          fi
+          
+          echo "Found instances: $INSTANCE_IDS"
+          
+          # Deploy to each instance using SSM
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=tag:aws:autoscaling:groupName,Values=${{ vars.PROJECT_NAME || 'artisan-tiling' }}-asg" \
+            --parameters "commands=[
+              'echo \"Starting deployment at $(date)\" >> /var/log/deployment.log',
+              'mkdir -p /var/www/app-temp',
+              'cd /var/www',
+              'sudo systemctl stop helloworldapi.service || true'
+            ]" \
+            --comment "Prepare for .NET 6 application deployment"
+          
+          # Wait for command to complete
+          sleep 15
+          
+          # Clone the repository on the server
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=tag:aws:autoscaling:groupName,Values=${{ vars.PROJECT_NAME || 'artisan-tiling' }}-asg" \
+            --parameters "commands=[
+              'cd /var/www/app-temp',
+              'rm -rf *',
+              'git clone https://github.com/${{ github.repository }}.git .',
+              'cp -r bin/Release/net6.0/publish/* .',
+              'rm -rf .git bin obj',
+              'ls -la'
+            ]" \
+            --comment "Clone and prepare application files"
+          
+          # Wait for command to complete
+          sleep 15
+          
+          # Run database migrations
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=instanceIds,Values=$INSTANCE_IDS" \
+            --parameters "commands=[
+              'cd /var/www/app-temp',
+              'echo \"Running database migrations at $(date)\" >> /var/log/deployment.log',
+              'sudo -u www-data dotnet HelloWorldApi.dll --migrate || echo \"Migration failed but continuing deployment\"'
+            ]" \
+            --comment "Run database migrations"
+          
+          # Wait for migrations to complete
+          sleep 30
+          
+          # Complete the deployment
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=tag:aws:autoscaling:groupName,Values=${{ vars.PROJECT_NAME || 'artisan-tiling' }}-asg" \
+            --parameters "commands=[
+              'cd /var/www',
+              'sudo rm -rf app-old',
+              'sudo mv app app-old || true',
+              'sudo mv app-temp app',
+              'sudo chown -R www-data:www-data /var/www/app',
+              'sudo chmod +x /var/www/app/HelloWorldApi.dll',
+              'sudo systemctl start helloworldapi.service',
+              'sudo systemctl status helloworldapi.service',
+              'echo \"Deployment completed at $(date)\" >> /var/log/deployment.log',
+              'sudo rm -rf app-old || true'
+            ]" \
+            --comment "Complete .NET 6 application deployment"
+          
+          echo "Deployment completed"
