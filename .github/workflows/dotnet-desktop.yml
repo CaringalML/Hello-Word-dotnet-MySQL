@@ -18,14 +18,10 @@ jobs:
         with:
           dotnet-version: '6.0.x'
       
-      - name: Restore dependencies
-        run: dotnet restore
-        
-      - name: Build
-        run: dotnet build --configuration Release --no-restore
-      
-      - name: Publish application
-        run: dotnet publish --configuration Release --no-build -o ./publish
+      - name: Build and publish
+        run: |
+          dotnet restore
+          dotnet publish -c Release -o ./publish
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v1
@@ -36,144 +32,32 @@ jobs:
       
       - name: Deploy to EC2 instances
         run: |
-          # Get instance IDs from the Auto Scaling Group
-          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-names "artisan-tiling-asg" \
-            --query "AutoScalingGroups[0].Instances[*].InstanceId" \
-            --output text)
+          # Create deployment files
+          echo "server { listen 80; server_name _; location / { proxy_pass http://localhost:5000; proxy_http_version 1.1; proxy_set_header Upgrade \$http_upgrade; proxy_set_header Connection keep-alive; proxy_set_header Host \$host; proxy_cache_bypass \$http_upgrade; } }" > ./publish/nginx.conf
           
-          for INSTANCE_ID in $INSTANCE_IDS; do
-            echo "Deploying to instance $INSTANCE_ID..."
-            
-            # Create a temp directory for the deployment files
-            DEPLOYMENT_DIR="$(mktemp -d)"
-            cp -r publish/* "$DEPLOYMENT_DIR/"
-            
-            # Create the nginx config file
-            cat > "$DEPLOYMENT_DIR/nginx.conf" << 'EOF'
-server {
-    listen 80;
-    server_name _;
-
-    location / {
-        proxy_pass http://localhost:5000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection keep-alive;
-        proxy_set_header Host $host;
-        proxy_cache_bypass $http_upgrade;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
-}
-EOF
-            
-            # Create the systemd service file
-            cat > "$DEPLOYMENT_DIR/helloworldapi.service" << 'EOF'
-[Unit]
-Description=Artisan Tiling API
-After=network.target
-
-[Service]
-WorkingDirectory=/var/www/app
-ExecStart=/usr/bin/dotnet /var/www/app/HelloWorldApi.dll
-Restart=always
-RestartSec=10
-SyslogIdentifier=helloworldapi
-User=www-data
-Environment=ASPNETCORE_URLS=http://localhost:5000
-Environment=ASPNETCORE_ENVIRONMENT=Production
-
-[Install]
-WantedBy=multi-user.target
-EOF
-            
-            # Create a deployment script
-            cat > "$DEPLOYMENT_DIR/deploy.sh" << 'EOF'
-#!/bin/bash
-set -e
-
-# Stop service if running
-sudo systemctl stop helloworldapi || echo "Service not running"
-
-# Clean and prepare directory
-sudo rm -rf /var/www/app/*
-sudo mkdir -p /var/www/app
-
-# Copy application files
-sudo cp -r ./* /var/www/app/
-sudo rm -f /var/www/app/nginx.conf /var/www/app/helloworldapi.service /var/www/app/deploy.sh
-
-# Set up nginx
-sudo cp ./nginx.conf /etc/nginx/sites-available/default
-sudo systemctl restart nginx
-
-# Set up service
-sudo cp ./helloworldapi.service /etc/systemd/system/helloworldapi.service
-sudo systemctl daemon-reload
-sudo systemctl enable helloworldapi
-
-# Fix permissions
-sudo chown -R www-data:www-data /var/www/app
-
-# Start the service
-sudo systemctl start helloworldapi
-sleep 3
-sudo systemctl status helloworldapi
-
-# Show logs
-echo "Recent application logs:"
-sudo journalctl -u helloworldapi -n 20 --no-pager
-EOF
-            chmod +x "$DEPLOYMENT_DIR/deploy.sh"
-            
-            # Zip the deployment package
-            cd "$DEPLOYMENT_DIR"
-            zip -r ../deploy.zip .
-            cd -
-            
-            # Upload and run via SSM
-            aws ssm send-command \
-              --document-name "AWS-RunShellScript" \
-              --targets "Key=instanceids,Values=$INSTANCE_ID" \
-              --parameters '{
-                "commands": [
-                  "mkdir -p /tmp/deploy",
-                  "cd /tmp/deploy",
-                  "rm -rf /tmp/deploy/*",
-                  "echo \"Starting deployment at $(date)\"",
-                  "aws ssm get-command-invocation --command-id {{CommandId}} --instance-id {{InstanceId}} --output text"
-                ]
-              }' \
-              --output text
-            
-            # Use Session Manager to directly transfer and execute
-            # This requires the EC2 instance to have the SSM agent
-            aws ssm start-session \
-              --target $INSTANCE_ID \
-              --document-name AWS-StartPortForwardingSession \
-              --parameters '{"portNumber":["22"],"localPortNumber":["9999"]}' &
-            
-            # Wait for port forwarding to start
-            sleep 5
-            
-            # Use SCP to transfer the deployment package
-            scp -P 9999 -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa deploy.zip ec2-user@localhost:/tmp/deploy/
-            
-            # Execute the deployment
-            aws ssm send-command \
-              --document-name "AWS-RunShellScript" \
-              --targets "Key=instanceids,Values=$INSTANCE_ID" \
-              --parameters '{
-                "commands": [
-                  "cd /tmp/deploy",
-                  "unzip -o deploy.zip",
-                  "./deploy.sh",
-                  "echo \"Deployment completed at $(date)\""
-                ]
-              }' \
-              --output text
-            
-            echo "Deployment to $INSTANCE_ID completed"
-          done
+          echo "[Unit]\nDescription=HelloWorld API\nAfter=network.target\n\n[Service]\nWorkingDirectory=/var/www/app\nExecStart=/usr/bin/dotnet /var/www/app/HelloWorldApi.dll\nRestart=always\nUser=www-data\nEnvironment=ASPNETCORE_URLS=http://localhost:5000\nEnvironment=ASPNETCORE_ENVIRONMENT=Production\n\n[Install]\nWantedBy=multi-user.target" > ./publish/app.service
+          
+          # Deploy to all instances in ASG
+          aws ssm send-command \
+            --document-name "AWS-RunShellScript" \
+            --targets "Key=tag:aws:autoscaling:groupName,Values=artisan-tiling-asg" \
+            --parameters '{
+              "commands": [
+                "sudo mkdir -p /var/www/app",
+                "sudo rm -rf /var/www/app/*",
+                "cd /tmp",
+                "git clone https://github.com/CaringalML/Hello-Word-dotnet-MySQL.git",
+                "cd Hello-Word-dotnet-MySQL",
+                "dotnet publish -c Release -o /tmp/publish",
+                "sudo cp -r /tmp/publish/* /var/www/app/",
+                "sudo cp /tmp/publish/nginx.conf /etc/nginx/sites-available/default || sudo bash -c \"echo \\\"server { listen 80; server_name _; location / { proxy_pass http://localhost:5000; proxy_http_version 1.1; proxy_set_header Upgrade \\\\$http_upgrade; proxy_set_header Connection keep-alive; proxy_set_header Host \\\\$host; proxy_cache_bypass \\\\$http_upgrade; } }\\\" > /etc/nginx/sites-available/default\"",
+                "sudo bash -c \"echo \\\"[Unit]\\nDescription=HelloWorld API\\nAfter=network.target\\n\\n[Service]\\nWorkingDirectory=/var/www/app\\nExecStart=/usr/bin/dotnet /var/www/app/HelloWorldApi.dll\\nRestart=always\\nUser=www-data\\nEnvironment=ASPNETCORE_URLS=http://localhost:5000\\nEnvironment=ASPNETCORE_ENVIRONMENT=Production\\n\\n[Install]\\nWantedBy=multi-user.target\\\" > /etc/systemd/system/helloworldapi.service\"",
+                "sudo chown -R www-data:www-data /var/www/app",
+                "sudo systemctl daemon-reload",
+                "sudo systemctl restart nginx",
+                "sudo systemctl enable helloworldapi",
+                "sudo systemctl restart helloworldapi",
+                "sudo systemctl status helloworldapi || true",
+                "echo \"Deployment completed\""
+              ]
+            }'
