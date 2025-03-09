@@ -1,4 +1,5 @@
-name: Deploy to EC2
+name: Deploy .NET API
+
 on:
   push:
     branches: [ main ]
@@ -11,112 +12,129 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
       
-      - name: Setup .NET Core
+      - name: Setup .NET
         uses: actions/setup-dotnet@v3
         with:
           dotnet-version: '6.0.x'
       
       - name: Restore dependencies
         run: dotnet restore
-      
-      - name: Build application
-        run: dotnet build --no-restore --configuration Release
+        
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
       
       - name: Publish application
-        run: dotnet publish --configuration Release --no-build
+        run: dotnet publish --configuration Release --no-build -o ./publish
+      
+      - name: Create deployment package
+        run: |
+          cd publish
+          zip -r ../deploy.zip .
       
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v1
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ vars.AWS_REGION || 'ap-southeast-2' }}
+          aws-region: ap-southeast-2
       
-      - name: Deploy to EC2 instances
+      - name: Upload deployment package directly to EC2 instances
         run: |
-          # Get the ASG name
-          ASG_NAME="${{ vars.PROJECT_NAME || 'artisan-tiling' }}-asg"
-          echo "Using ASG: $ASG_NAME"
-          
-          # Prepare instances for deployment
-          echo "Preparing instances for deployment..."
-          aws ssm send-command \
-            --document-name "AWS-RunShellScript" \
-            --targets "Key=tag:aws:autoscaling:groupName,Values=$ASG_NAME" \
-            --parameters "commands=[
-              'echo \"Starting deployment at $(date)\" >> /var/log/deployment.log',
-              'mkdir -p /var/www/app-temp',
-              'cd /var/www',
-              'sudo systemctl stop helloworldapi.service || true'
-            ]" \
-            --comment "Prepare for .NET 6 application deployment"
-          
-          # Wait for command to complete
-          sleep 15
-          
-          # Clone the repository on the server
-          echo "Cloning repository and preparing files..."
-          aws ssm send-command \
-            --document-name "AWS-RunShellScript" \
-            --targets "Key=tag:aws:autoscaling:groupName,Values=$ASG_NAME" \
-            --parameters "commands=[
-              'cd /var/www/app-temp',
-              'rm -rf *',
-              'git clone https://github.com/${{ github.repository }}.git .',
-              'cp -r bin/Release/net6.0/publish/* .',
-              'rm -rf .git bin obj',
-              'ls -la'
-            ]" \
-            --comment "Clone and prepare application files"
-          
-          # Wait for command to complete
-          sleep 15
-          
-          # Run database migrations - only on one instance to avoid duplicate migrations
-          echo "Running database migrations..."
-          
-          # Get the first instance from the ASG
-          FIRST_INSTANCE=$(aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-name $ASG_NAME \
-            --query "AutoScalingGroups[0].Instances[0].InstanceId" \
+          # Get instance IDs from the Auto Scaling Group
+          INSTANCE_IDS=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "artisan-tiling-asg" \
+            --query "AutoScalingGroups[0].Instances[*].InstanceId" \
             --output text)
           
-          echo "Selected instance for migrations: $FIRST_INSTANCE"
-          
-          if [ -n "$FIRST_INSTANCE" ]; then
+          # Deploy to each instance
+          for INSTANCE_ID in $INSTANCE_IDS; do
+            echo "Deploying to instance $INSTANCE_ID..."
+            
+            # Upload deployment package directly using SSM
             aws ssm send-command \
               --document-name "AWS-RunShellScript" \
-              --targets "Key=instanceIds,Values=$FIRST_INSTANCE" \
+              --targets "Key=instanceids,Values=$INSTANCE_ID" \
               --parameters "commands=[
-                'cd /var/www/app-temp',
-                'echo \"Running database migrations at $(date)\" >> /var/log/deployment.log',
-                'sudo -u www-data dotnet HelloWorldApi.dll --migrate || echo \"Migration failed but continuing deployment\"'
+                # Create temp directory for deployment
+                'mkdir -p /tmp/app-deploy',
+                'cd /tmp/app-deploy',
+                
+                # Stop service
+                'sudo systemctl stop helloworldapi || echo \"Service not running\"',
+                
+                # Clean and prepare directory
+                'sudo rm -rf /var/www/app/*',
+                'sudo mkdir -p /var/www/app',
+                
+                # Clone directly from GitHub
+                'git clone https://github.com/${{ github.repository }}.git app-source',
+                'cd app-source',
+                
+                # Build the application on the server
+                'dotnet restore',
+                'dotnet publish --configuration Release -o /tmp/app-deploy/publish',
+                
+                # Copy files to app directory
+                'sudo cp -r /tmp/app-deploy/publish/* /var/www/app/',
+                
+                # Ensure correct nginx configuration
+                'sudo bash -c \"cat > /etc/nginx/sites-available/default << EOL
+                server {
+                    listen 80;
+                    server_name _;
+                    
+                    location / {
+                        proxy_pass http://localhost:5000;
+                        proxy_http_version 1.1;
+                        proxy_set_header Upgrade \\$http_upgrade;
+                        proxy_set_header Connection keep-alive;
+                        proxy_set_header Host \\$host;
+                        proxy_cache_bypass \\$http_upgrade;
+                        proxy_set_header X-Forwarded-For \\$proxy_add_x_forwarded_for;
+                        proxy_set_header X-Forwarded-Proto \\$scheme;
+                        proxy_set_header X-Real-IP \\$remote_addr;
+                    }
+                }
+                EOL\"',
+                
+                # Ensure correct service configuration
+                'sudo bash -c \"cat > /etc/systemd/system/helloworldapi.service << EOL
+                [Unit]
+                Description=Artisan Tiling API
+                After=network.target
+                
+                [Service]
+                WorkingDirectory=/var/www/app
+                ExecStart=/usr/bin/dotnet /var/www/app/HelloWorldApi.dll
+                Restart=always
+                RestartSec=10
+                SyslogIdentifier=helloworldapi
+                User=www-data
+                Environment=ASPNETCORE_URLS=http://localhost:5000
+                Environment=ASPNETCORE_ENVIRONMENT=Production
+                
+                [Install]
+                WantedBy=multi-user.target
+                EOL\"',
+                
+                # Fix permissions
+                'sudo chown -R www-data:www-data /var/www/app',
+                
+                # Reload systemd and restart services
+                'sudo systemctl daemon-reload',
+                'sudo systemctl restart nginx',
+                'sudo systemctl enable helloworldapi',
+                'sudo systemctl restart helloworldapi',
+                
+                # Verify service is running
+                'sleep 5',
+                'sudo systemctl status helloworldapi',
+                'curl -s http://localhost:5000/api/hello || echo \"API endpoint not available yet\"',
+                
+                # Check logs for errors
+                'sudo journalctl -u helloworldapi -n 20 --no-pager'
               ]" \
-              --comment "Run database migrations"
+              --output text
             
-            # Wait for migrations to complete
-            sleep 30
-          else
-            echo "No instances found for migrations"
-          fi
-          
-          # Complete the deployment
-          echo "Completing deployment..."
-          aws ssm send-command \
-            --document-name "AWS-RunShellScript" \
-            --targets "Key=tag:aws:autoscaling:groupName,Values=$ASG_NAME" \
-            --parameters "commands=[
-              'cd /var/www',
-              'sudo rm -rf app-old',
-              'sudo mv app app-old || true',
-              'sudo mv app-temp app',
-              'sudo chown -R www-data:www-data /var/www/app',
-              'sudo chmod +x /var/www/app/HelloWorldApi.dll',
-              'sudo systemctl start helloworldapi.service',
-              'sudo systemctl status helloworldapi.service',
-              'echo \"Deployment completed at $(date)\" >> /var/log/deployment.log',
-              'sudo rm -rf app-old || true'
-            ]" \
-            --comment "Complete .NET 6 application deployment"
-          
-          echo "Deployment completed"
+            echo "Deployment to $INSTANCE_ID completed"
+          done
